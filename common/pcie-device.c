@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
-#include "pcie_device.h"
+#include "pcie-device.h"
 
 const char *get_pcie_device(pcie_dev_type_t type)
 {

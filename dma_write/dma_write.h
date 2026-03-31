@@ -2,7 +2,7 @@
 #define DMA_WRITE_H
 
 #include <stdint.h>
-#include "pcie_device.h"
+#include "pcie-device.h"
 
 int dma_write_run(const char *file,
                   uint64_t address,

@@ -8,7 +8,7 @@
 #include <time.h>
 
 #include "xdma/cdev_sgdma.h"
-#include "../common/pcie_device.h"
+#include "pcie-device.h"
 #include "dma_read.h"
 
 extern int verbose;
