@@ -8,6 +8,33 @@
 #include "drivers/pcie.h"
 #include "drivers/timer.h"
 
+// 해당 pcie.c 코드는 PCIe 프로토콜 스택 중 가장 하위 계층인 물리 계층(Physical Layer)의 초기화와 데이터 링크 계층 (Data Link Layer)의 활성화를 제어하며
+// 상위 트랜잭션 게층이 동작할 수 있도록 주소 쳬계를 잡아주는 역할을 함.
+
+// 1. 물리 계층 (physical Layer): 하드웨어의 전기적 연결, 차동 신호, 속도(Gen), 레인(Lane) 수를 직접 결정하는 부분.
+// 관련 코드
+// gtx_pcie_set_num_lanes: 물리적인 선(Lane)의 개수를 설정.
+// gtx_pcie_set_target_speed: 데이터 전송 속도(Gen1 ~ Gen5)를 결정.
+// gtx_pcie_is_link_up: LTSSM(상태 머신)이 L0(정상 작동) 상태인지 확인.
+// 하드웨어 동작: 실제 구리선에서 전기 신호가 오가고, 클럭이 동기화되는 물리적인 준비 단계
+
+// 2. 데이터 링크 계층 (Data Link Layer): 패킷 전송의 신뢰성을 확보하고 링크를 유지하는 단계
+// 관련 코드
+// gtx_pcie_start_link 내의 GTX_PORT_LINK_DLL_EN: 데이터 링크 계층(DLL)을 활성화.
+// gtx_pcie_get_link_status 내의 status -> dll_active: DLL이 활성화되어 패킷을 주고 받을 준비가 됐는지 확인
+// 하드웨어 동작: 패킷이 깨졌을 때 다시 보내는 Ack/Nak 메커니즘과 흐름 제어(Flow Control)가 이 계층에서 하드웨어적으로 처리.
+
+// 3. 트랜잭션 계층 (Transaction Layer): CPU가 메모리 읽기/쓰기 명령을 내렸을 때 이를 TLP(Transaction Layer Packet)로 변환하기 위한 주소 지도를 그리는 단계.
+// 관련 코드
+// gtx_pcie_configure_atu: PCIe 내부의 주소 변환 장치(iATU)를 설정.
+// gtx_pcie_setup_inbound_bar: 호스트(PC)가 내 메모리에 접근할 수 있는 창구(BAR)를 염.
+// 하드웨어 동작: CPU 주소를 PCIe 버스 주소로, 혹은 그 반대로 하드웨어가 실시간으로 번역할 수 있게 세팅.
+
+// 4. 설정 공간(Configuration Space): PCIe 스펙에서 정의한 표준 레지스터를 건드려 하드웨어의 기능을 탐색하는 부분.
+// 관련 코드
+// pcie_find_capability: 하드웨어가 지원하는 특수 기능의 위치를 찾음.
+// gtx_pcie_setup_msi: 메시지 기반 인터럽트(MSI)를 설정.
+
 /*=============================================================================
  * Private Data
  *============================================================================*/
@@ -84,6 +111,7 @@ void gtx_pcie_write_dbi8(uint32_t offset, uint8_t value) {
 /*=============================================================================
  * Private Helper Functions
  *============================================================================*/
+
 
 static void pcie_set_bits(uint32_t offset, uint32_t bits) {
     uint32_t val = gtx_pcie_read_dbi(offset);

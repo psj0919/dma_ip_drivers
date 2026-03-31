@@ -1,0 +1,403 @@
+dma_ip_drivers git: https://github.com/Xilinx/dma_ip_drivers/tree/master/XDMA/linux-kernel
+PCIe 개념: https://melonicedlatte.com/computerarchitecture/2019/06/16/141600.html
+PCI Drivers: https://www.kernel.org/doc/html/latest/PCI/pci.html
+Device Drivers: https://reakwon.tistory.com/150
+linux/pci.h: https://github.com/torvalds/linux/blob/master/include/linux/pci.h
+confluence/driver 검색, PCIe & FPGA 시스템 구조 세미나, PCIe 동작 및 매핑 관계
+Notebook LM -> PCIe 책 정리
+
+
+
+/**
+ * @file ggml_swiglu_request.cpp
+ * @brief GGML SWIGLU request (loopback) example
+ *
+ * Builds a SWIGLU graph packet and submits it via the message queue
+ * to the in-process GGML PCIe server handler.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <atomic>
+
+#include "drivers/message.h"
+#include "drivers/pcie-elbi-regs.h"
+#include "drivers/pcie-regs.h"
+#include "gtx/ggml-gtx-rpc.h"
+
+/*=============================================================================
+ * PCIe Queue Constants
+ *============================================================================*/
+
+#define GGML_GTX_MSG_QUEUE_BASE   0x00000000UL
+#define GGML_GTX_MSG_QUEUE_SIZE   (64U * 1024U)
+
+/*=============================================================================
+ * Queue Layout (host-side)
+ *============================================================================*/
+
+typedef struct {
+    volatile uint32_t *rx_head;
+    volatile uint32_t *rx_tail;
+    volatile uint32_t *tx_head;
+    volatile uint32_t *tx_tail;
+    ggml_gtx_message_t *rx_queue;
+    ggml_gtx_message_t *tx_queue;
+    uint32_t queue_entries;
+} ggml_queue_layout_t;
+
+static void queue_layout_init(void *queue_base, size_t queue_size, ggml_queue_layout_t *layout)
+{
+    uint8_t *base = static_cast<uint8_t *>(queue_base);
+
+    layout->rx_head = reinterpret_cast<volatile uint32_t *>(base + 0);
+    layout->rx_tail = reinterpret_cast<volatile uint32_t *>(base + 4);
+    layout->tx_head = reinterpret_cast<volatile uint32_t *>(base + 8);
+    layout->tx_tail = reinterpret_cast<volatile uint32_t *>(base + 12);
+
+    size_t data_size = queue_size - 64;
+    layout->queue_entries = static_cast<uint32_t>((data_size / 2) / sizeof(ggml_gtx_message_t));
+
+    layout->rx_queue = reinterpret_cast<ggml_gtx_message_t *>(base + 64);
+    layout->tx_queue = layout->rx_queue + layout->queue_entries;
+}
+
+static bool host_send(ggml_queue_layout_t *layout, const ggml_gtx_message_t *msg)
+{
+    uint32_t head = *layout->rx_head;
+    uint32_t tail = *layout->rx_tail;
+    uint32_t next_head = (head + 1U) % layout->queue_entries;
+
+    if (next_head == tail) {
+        return false;
+    }
+
+    memcpy(&layout->rx_queue[head], msg, sizeof(ggml_gtx_message_t));
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    *layout->rx_head = next_head;
+    return true;
+}
+
+static bool host_receive(ggml_queue_layout_t *layout, ggml_gtx_message_t *msg)
+{
+    uint32_t head = *layout->tx_head;
+    uint32_t tail = *layout->tx_tail;
+
+    if (tail == head) {
+        return false;
+    }
+
+    memcpy(msg, &layout->tx_queue[tail], sizeof(ggml_gtx_message_t));
+    uint32_t next_tail = (tail + 1U) % layout->queue_entries;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    *layout->tx_tail = next_tail;
+    return true;
+}
+
+/*=============================================================================
+ * Example
+ *============================================================================*/
+
+static ggml_gtx_graph_op_packet_t g_packet __attribute__((aligned(64)));
+
+static uint32_t g_rng_state = 1U;
+
+static uint32_t rng_next_u32(void)
+{
+    g_rng_state = g_rng_state * 1664525U + 1013904223U;
+    return g_rng_state;
+}
+
+static float rng_next_f32(void)
+{
+    uint32_t v = rng_next_u32();
+    float unit = (float)((v >> 8) & 0xFFFFFFU) / 16777215.0f;
+    return (unit * 2.0f) - 1.0f;
+}
+
+static uint16_t float_to_fp16(float value)
+{
+    uint32_t bits = 0U;
+    memcpy(&bits, &value, sizeof(bits));
+
+    uint16_t sign = (uint16_t)((bits >> 16) & 0x8000U);
+    uint32_t mantissa = bits & 0x007FFFFFU;
+    int32_t exp = (int32_t)((bits >> 23) & 0xFFU) - 127 + 15;
+
+    if (exp <= 0) {
+        if (exp < -10) {
+            return sign;
+        }
+        mantissa = (mantissa | 0x00800000U) >> (1 - exp);
+        if (mantissa & 0x00001000U) {
+            mantissa += 0x00002000U;
+        }
+        return (uint16_t)(sign | (mantissa >> 13));
+    }
+
+    if (exp >= 31) {
+        return (uint16_t)(sign | 0x7C00U);
+    }
+
+    if (mantissa & 0x00001000U) {
+        mantissa += 0x00002000U;
+        if (mantissa & 0x00800000U) {
+            mantissa = 0U;
+            exp += 1;
+            if (exp >= 31) {
+                return (uint16_t)(sign | 0x7C00U);
+            }
+        }
+    }
+
+    return (uint16_t)(sign | ((uint16_t)exp << 10) | (uint16_t)(mantissa >> 13));
+}
+
+static float fp16_to_float(uint16_t value)
+{
+    uint32_t sign = ((uint32_t)value & 0x8000U) << 16;
+    uint32_t exp = (value >> 10) & 0x1FU;
+    uint32_t mantissa = value & 0x03FFU;
+    uint32_t out_bits = 0U;
+
+    if (exp == 0) {
+        if (mantissa == 0) {
+            out_bits = sign;
+        } else {
+            exp = 1;
+            while ((mantissa & 0x0400U) == 0U) {
+                mantissa <<= 1;
+                exp -= 1;
+            }
+            mantissa &= 0x03FFU;
+            exp = exp + (127 - 15);
+            out_bits = sign | (exp << 23) | (mantissa << 13);
+        }
+    } else if (exp == 31) {
+        out_bits = sign | 0x7F800000U | (mantissa << 13);
+    } else {
+        exp = exp + (127 - 15);
+        out_bits = sign | (exp << 23) | (mantissa << 13);
+    }
+
+    float out = 0.0f;
+    memcpy(&out, &out_bits, sizeof(out));
+    return out;
+}
+
+static float exp_approx(float x)
+{
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float x4 = x2 * x2;
+    float x5 = x4 * x;
+    return 1.0f + x + (x2 * 0.5f) + (x3 * (1.0f / 6.0f)) +
+           (x4 * (1.0f / 24.0f)) + (x5 * (1.0f / 120.0f));
+}
+
+int main(void)
+{
+    printf("========================================\n");
+    printf("  GGML SWIGLU Host Request\n");
+    printf("========================================\n");
+
+    ggml_queue_layout_t layout = {};
+    queue_layout_init(
+        (void *)(uintptr_t)(GGML_GTX_PCIE_SLAVE_BASE + GGML_GTX_MSG_QUEUE_BASE),
+        GGML_GTX_MSG_QUEUE_SIZE,
+        &layout);
+
+    const uint16_t n_rows = 1;
+    const uint16_t n_cols = 8;
+    const uint32_t input_bytes = static_cast<uint32_t>(n_rows * n_cols * 2U);
+    const uint32_t output_bytes = static_cast<uint32_t>(n_rows * (n_cols / 2U) * 2U);
+
+    ggml_gtx_message_t msg = {};
+    ggml_gtx_message_t rsp = {};
+    uint32_t seq = 1;
+
+    gtx_msg_alloc_buffer_req alloc_req = { .device = 0, .size = input_bytes };
+    ggml_gtx_msg_init(&msg);
+    msg.seq_num = seq++;
+    msg.type = GTX_CMD_ALLOC_BUFFER;
+    msg.size = sizeof(alloc_req);
+    memcpy(msg.payload, &alloc_req, sizeof(alloc_req));
+    if (!host_send(&layout, &msg)) {
+        printf("[SWIGLU] Failed to enqueue input alloc\n");
+        return 1;
+    }
+    *(volatile uint32_t *)(uintptr_t)(GGML_GTX_PCIE_SLAVE_BASE + GGML_GTX_ELBI_BAR0_INT_GEN) =
+        GGML_GTX_DOORBELL_MASK(GGML_GTX_DOORBELL_CMD_READY);
+    while (!host_receive(&layout, &rsp)) { }
+    if (ggml_gtx_msg_get_status(&rsp) != GGML_GTX_MSG_STATUS_OK) 
+    {
+        printf("[SWIGLU] Input alloc failed\n");
+        return 1;
+    }
+
+    gtx_msg_alloc_buffer_rsp in_rsp = {};
+    memcpy(&in_rsp, rsp.payload, sizeof(in_rsp));
+
+    alloc_req.size = output_bytes;
+    ggml_gtx_msg_init(&msg);
+    msg.seq_num = seq++;
+    msg.type = GTX_CMD_ALLOC_BUFFER;
+    msg.size = sizeof(alloc_req);
+    memcpy(msg.payload, &alloc_req, sizeof(alloc_req));
+    if (!host_send(&layout, &msg)) {
+        printf("[SWIGLU] Failed to enqueue output alloc\n");
+        return 1;
+    }
+    *(volatile uint32_t *)(uintptr_t)(GGML_GTX_PCIE_SLAVE_BASE + GGML_GTX_ELBI_BAR0_INT_GEN) =
+        GGML_GTX_DOORBELL_MASK(GGML_GTX_DOORBELL_CMD_READY);
+    while (!host_receive(&layout, &rsp)) { }
+    if (ggml_gtx_msg_get_status(&rsp) != GGML_GTX_MSG_STATUS_OK) {
+        printf("[SWIGLU] Output alloc failed\n");
+        return 1;
+    }
+    gtx_msg_alloc_buffer_rsp out_rsp = {};
+    memcpy(&out_rsp, rsp.payload, sizeof(out_rsp));
+
+    alloc_req.size = sizeof(ggml_gtx_graph_op_packet_t);
+    ggml_gtx_msg_init(&msg);
+    msg.seq_num = seq++;
+    msg.type = GTX_CMD_ALLOC_BUFFER;
+    msg.size = sizeof(alloc_req);
+    memcpy(msg.payload, &alloc_req, sizeof(alloc_req));
+    if (!host_send(&layout, &msg)) {
+        printf("[SWIGLU] Failed to enqueue packet alloc\n");
+        return 1;
+    }
+    *(volatile uint32_t *)(uintptr_t)(GGML_GTX_PCIE_SLAVE_BASE + GGML_GTX_ELBI_BAR0_INT_GEN) =
+        GGML_GTX_DOORBELL_MASK(GGML_GTX_DOORBELL_CMD_READY);
+    while (!host_receive(&layout, &rsp)) { }
+    if (ggml_gtx_msg_get_status(&rsp) != GGML_GTX_MSG_STATUS_OK) {
+        printf("[SWIGLU] Packet alloc failed\n");
+        return 1;
+    }
+
+    gtx_msg_alloc_buffer_rsp pkt_rsp = {};
+    memcpy(&pkt_rsp, rsp.payload, sizeof(pkt_rsp));
+
+    uint64_t ddr_input = in_rsp.remote_ptr;
+    uint64_t ddr_output = out_rsp.remote_ptr;
+    uint64_t ddr_packet = pkt_rsp.remote_ptr;
+
+    volatile uint16_t *input = reinterpret_cast<volatile uint16_t *>(
+        static_cast<uintptr_t>(ddr_input));
+    volatile uint16_t *output = reinterpret_cast<volatile uint16_t *>(
+        static_cast<uintptr_t>(ddr_output));
+
+    uint16_t expected[8] = {};
+    float expected_f32[8] = {};
+
+    for (uint16_t i = 0; i < n_cols; i++) {
+        float sample = rng_next_f32();
+        input[i] = float_to_fp16(sample);
+    }
+    for (uint16_t i = 0; i < (n_cols / 2U); i++) {
+        float a = fp16_to_float(input[i]);
+        float b = fp16_to_float(input[i + (n_cols / 2U)]);
+        float silu = a / (1.0f + exp_approx(-a));
+        float out = silu * b;
+        expected_f32[i] = out;
+        expected[i] = float_to_fp16(out);
+        output[i] = 0xFFFFU;
+    }
+
+    memset(&g_packet, 0, sizeof(g_packet));
+    g_packet.op = GGML_GTX_GRAPH_OP_SWIGLU;
+    g_packet.nest_num = 1;
+    g_packet.spu_num_per_nest = 1;
+    g_packet.src0_addr = ddr_input;
+    g_packet.dst_addr = ddr_output;
+    g_packet.args[0] = n_rows;
+    g_packet.args[1] = n_cols;
+    g_packet.args[3] = 0;
+    memcpy((void *)(uintptr_t)ddr_packet, &g_packet, sizeof(g_packet));
+
+    ggml_gtx_msg_graph_compute_req_t req = {
+        .packets_addr = ddr_packet,
+        .packet_count = 1,
+        .flags = 0,
+    };
+
+    ggml_gtx_msg_init(&msg);
+    msg.seq_num = seq++;
+    msg.type = GTX_CMD_GRAPH_COMPUTE;
+    msg.size = sizeof(req);
+    memcpy(msg.payload, &req, sizeof(req));
+
+    if (!host_send(&layout, &msg)) {
+        printf("[SWIGLU] Failed to enqueue request\n");
+        return 1;
+    }
+    *(volatile uint32_t *)(uintptr_t)(GGML_GTX_PCIE_SLAVE_BASE + GGML_GTX_ELBI_BAR0_INT_GEN) =
+        GGML_GTX_DOORBELL_MASK(GGML_GTX_DOORBELL_CMD_READY);
+
+    while (!host_receive(&layout, &rsp)) { }
+    printf("[SWIGLU] Response status: %u\n", ggml_gtx_msg_get_status(&rsp));
+
+    uint32_t mismatch = 0;
+    float max_diff = 0.0f;
+    for (uint16_t i = 0; i < (n_cols / 2U); i++) {
+        float out_f32 = fp16_to_float(output[i]);
+        float diff = out_f32 - expected_f32[i];
+        if (diff < 0.0f) {
+            diff = -diff;
+        }
+        if (diff > max_diff) {
+            max_diff = diff;
+        }
+        if (diff > 0.02f) {
+            mismatch++;
+        }
+    }
+
+    printf("[SWIGLU] Output:   %04x %04x %04x %04x\n",
+           output[0], output[1], output[2], output[3]);
+    printf("[SWIGLU] Expected: %04x %04x %04x %04x\n",
+           expected[0], expected[1], expected[2], expected[3]);
+    printf("[SWIGLU] Compare: %s (%u mismatches, max diff=%.4f)\n",
+           (mismatch == 0U) ? "PASS" : "FAIL", mismatch, max_diff);
+
+    gtx_msg_free_buffer_req free_req = {};
+
+    free_req.remote_ptr = ddr_input;
+    ggml_gtx_msg_init(&msg);
+    msg.seq_num = seq++;
+    msg.type = GTX_CMD_FREE_BUFFER;
+    msg.size = sizeof(free_req);
+    memcpy(msg.payload, &free_req, sizeof(free_req));
+    (void)host_send(&layout, &msg);
+    *(volatile uint32_t *)(uintptr_t)(GGML_GTX_PCIE_SLAVE_BASE + GGML_GTX_ELBI_BAR0_INT_GEN) =
+        GGML_GTX_DOORBELL_MASK(GGML_GTX_DOORBELL_CMD_READY);
+    while (!host_receive(&layout, &rsp)) { }
+
+    free_req.remote_ptr = ddr_output;
+    ggml_gtx_msg_init(&msg);
+    msg.seq_num = seq++;
+    msg.type = GTX_CMD_FREE_BUFFER;
+    msg.size = sizeof(free_req);
+    memcpy(msg.payload, &free_req, sizeof(free_req));
+    (void)host_send(&layout, &msg);
+    *(volatile uint32_t *)(uintptr_t)(GGML_GTX_PCIE_SLAVE_BASE + GGML_GTX_ELBI_BAR0_INT_GEN) =
+        GGML_GTX_DOORBELL_MASK(GGML_GTX_DOORBELL_CMD_READY);
+    while (!host_receive(&layout, &rsp)) { }
+
+    free_req.remote_ptr = ddr_packet;
+    ggml_gtx_msg_init(&msg);
+    msg.seq_num = seq++;
+    msg.type = GTX_CMD_FREE_BUFFER;
+    msg.size = sizeof(free_req);
+    memcpy(msg.payload, &free_req, sizeof(free_req));
+    (void)host_send(&layout, &msg);
+    *(volatile uint32_t *)(uintptr_t)(GGML_GTX_PCIE_SLAVE_BASE + GGML_GTX_ELBI_BAR0_INT_GEN) =
+        GGML_GTX_DOORBELL_MASK(GGML_GTX_DOORBELL_CMD_READY);
+    while (!host_receive(&layout, &rsp)) { }
+
+    return 0;
+}
